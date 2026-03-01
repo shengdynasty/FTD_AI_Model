@@ -1,5 +1,5 @@
 # app.py
-# Compact single-page FTD Survival App
+# Minimal Research Dashboard Version
 # Run: streamlit run app.py
 
 import os
@@ -12,22 +12,22 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from lifelines import CoxPHFitter, KaplanMeierFitter
 
-# -----------------------------
-# Dark theme + compact plots
-# -----------------------------
+# -----------------------
+# Compact dark plots
+# -----------------------
 plt.style.use("dark_background")
 plt.rcParams.update({
-    "figure.figsize": (5.2, 2.6),
-    "axes.titlesize": 10,
-    "axes.labelsize": 9,
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
+    "figure.figsize": (4.8, 2.4),
+    "axes.titlesize": 9,
+    "axes.labelsize": 8,
+    "xtick.labelsize": 7,
+    "ytick.labelsize": 7,
 })
 
-# -----------------------------
+# -----------------------
 # CONFIG
-# -----------------------------
-DEFAULT_DATA_PATH = "cell_data.csv"
+# -----------------------
+DATA_PATH = "cell_data.csv"
 
 FEATURE_COLS = [
     "neurite_growth",
@@ -42,21 +42,19 @@ EVENT_COL = "event_observed"
 PENALIZER = 0.05
 
 
-# -----------------------------
+# -----------------------
 # Helpers
-# -----------------------------
-def load_dataframe(uploaded_file, fallback_path):
-    if uploaded_file is not None:
-        return pd.read_csv(uploaded_file)
-
-    if not os.path.exists(fallback_path):
-        st.error("Upload a CSV or place cell_data.csv next to app.py.")
+# -----------------------
+def load_data(upload):
+    if upload:
+        return pd.read_csv(upload)
+    if not os.path.exists(DATA_PATH):
+        st.error("Upload CSV or include cell_data.csv.")
         st.stop()
+    return pd.read_csv(DATA_PATH)
 
-    return pd.read_csv(fallback_path)
 
-
-def validate_columns(df):
+def validate(df):
     required = FEATURE_COLS + [DURATION_COL, EVENT_COL]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -64,58 +62,30 @@ def validate_columns(df):
         st.stop()
 
 
-def verbal_prediction(std_features, summary):
+def verbal_pred(std, summary):
     coefs = summary["coef"].to_dict()
-    contribs = {k: coefs[k] * std_features[k] for k in FEATURE_COLS}
-    lin = sum(contribs.values())
-    risk = math.exp(lin)
+    contrib = {k: coefs[k] * std[k] for k in FEATURE_COLS}
+    risk = math.exp(sum(contrib.values()))
 
     if risk > 2:
-        bucket = "HIGH"
+        lvl = "HIGH"
     elif risk > 1.2:
-        bucket = "MODERATE"
+        lvl = "MODERATE"
     else:
-        bucket = "LOW"
+        lvl = "LOW"
 
-    top = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-
-    text = f"""
-**Relative risk:** {risk:.2f}× baseline  
-**Risk level:** {bucket}
-
-Top drivers:
-- {top[0][0]}
-- {top[1][0]}
-- {top[2][0]}
-"""
-    return text
+    return f"Risk: {risk:.2f}× | Level: {lvl}"
 
 
-def simple_chat(msg, summary):
-    msg = msg.lower()
+# -----------------------
+# UI
+# -----------------------
+st.set_page_config(layout="wide")
+st.title("FTD Survival Dashboard")
 
-    if "important" in msg:
-        s = summary.copy()
-        s["abs"] = s["coef"].abs()
-        top = s.sort_values("abs", ascending=False).head(3)
-        return f"Strongest predictors: {', '.join(top.index)}"
-
-    if "hazard" in msg:
-        return "Hazard ratio >1 means faster failure. <1 means protective."
-
-    return "Ask about feature importance or hazard ratios."
-
-
-# -----------------------------
-# APP
-# -----------------------------
-st.set_page_config(layout="centered")
-st.title("FTD Cell Survival Model")
-
-# Sidebar upload
-uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-df = load_dataframe(uploaded_file, DEFAULT_DATA_PATH)
-validate_columns(df)
+upload = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+df = load_data(upload)
+validate(df)
 
 df = df.dropna(subset=FEATURE_COLS + [DURATION_COL, EVENT_COL])
 df[EVENT_COL] = df[EVENT_COL].astype(int)
@@ -130,133 +100,117 @@ cph.fit(df_scaled[FEATURE_COLS + [DURATION_COL, EVENT_COL]],
         duration_col=DURATION_COL,
         event_col=EVENT_COL)
 
-summary = cph.summary.loc[FEATURE_COLS, ["coef", "exp(coef)", "p"]]
+summary = cph.summary.loc[FEATURE_COLS, ["coef", "exp(coef)"]]
 
-# =========================
-# 1) Predict
-# =========================
-st.header("Predict")
+# -----------------------
+# Layout (2-column dashboard)
+# -----------------------
+left, right = st.columns([1, 1.4])
 
-col1, col2 = st.columns(2)
+# ===== LEFT PANEL =====
+with left:
+    st.subheader("Predict")
 
-with col1:
-    st.dataframe(summary, height=200)
-
-with col2:
     inputs = {}
     for f in FEATURE_COLS:
         inputs[f] = st.number_input(f, value=float(df[f].mean()))
 
-    if st.button("Predict"):
+    if st.button("Run"):
         arr = np.array([[inputs[f] for f in FEATURE_COLS]])
         arr_s = scaler.transform(arr)[0]
         std = {FEATURE_COLS[i]: arr_s[i] for i in range(len(FEATURE_COLS))}
-        st.markdown(verbal_prediction(std, summary))
+        st.success(verbal_pred(std, summary))
 
-st.divider()
+    st.divider()
 
-# =========================
-# 2) Visualize
-# =========================
-st.header("Visualize")
+    st.subheader("Model Coefficients")
+    st.dataframe(summary, height=180)
 
-graph_choice = st.selectbox("Select Graph", [
-    "Feature Histogram",
-    "Correlation Heatmap",
-    "Kaplan–Meier Overall",
-    "Kaplan–Meier Split",
-    "Hazard Ratios",
-    "Risk Distribution"
-])
+    st.divider()
 
-# Histogram
-if graph_choice == "Feature Histogram":
-    feat = st.selectbox("Feature", FEATURE_COLS)
-    fig, ax = plt.subplots()
-    ax.hist(df[feat], bins=30)
-    ax.set_title(feat)
-    fig.tight_layout()
-    st.pyplot(fig)
+    st.subheader("Chat")
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
 
-# Correlation
-elif graph_choice == "Correlation Heatmap":
-    corr = df[FEATURE_COLS].corr()
-    fig, ax = plt.subplots(figsize=(5, 3))
-    im = ax.imshow(corr.values, vmin=-1, vmax=1)
-    ax.set_xticks(range(len(FEATURE_COLS)))
-    ax.set_yticks(range(len(FEATURE_COLS)))
-    ax.set_xticklabels(FEATURE_COLS, rotation=45, ha="right")
-    ax.set_yticklabels(FEATURE_COLS)
-    fig.colorbar(im)
-    fig.tight_layout()
-    st.pyplot(fig)
+    msg = st.text_input("Ask about hazard ratios")
+    if msg:
+        st.session_state.chat.append(msg)
 
-# KM Overall
-elif graph_choice == "Kaplan–Meier Overall":
-    kmf = KaplanMeierFitter()
-    fig, ax = plt.subplots()
-    kmf.fit(df[DURATION_COL], df[EVENT_COL])
-    kmf.plot(ax=ax)
-    ax.set_title("Overall Survival")
-    fig.tight_layout()
-    st.pyplot(fig)
+    for m in st.session_state.chat[-3:]:
+        st.caption(f"> {m}")
 
-# KM Split
-elif graph_choice == "Kaplan–Meier Split":
-    feat = st.selectbox("Split Feature", FEATURE_COLS)
-    med = df[feat].median()
-    high = df[df[feat] >= med]
-    low = df[df[feat] < med]
+# ===== RIGHT PANEL =====
+with right:
+    st.subheader("Visualization")
 
-    kmf = KaplanMeierFitter()
-    fig, ax = plt.subplots()
-    kmf.fit(low[DURATION_COL], low[EVENT_COL], label="Low")
-    kmf.plot(ax=ax)
-    kmf.fit(high[DURATION_COL], high[EVENT_COL], label="High")
-    kmf.plot(ax=ax)
-    ax.set_title(f"Survival by {feat}")
-    fig.tight_layout()
-    st.pyplot(fig)
+    graph = st.selectbox("Graph Type", [
+        "Histogram",
+        "Correlation",
+        "KM Overall",
+        "KM Split",
+        "Hazard Ratios",
+        "Risk Distribution"
+    ])
 
-# Hazard Ratios
-elif graph_choice == "Hazard Ratios":
-    hr = summary["exp(coef)"]
-    fig, ax = plt.subplots()
-    ax.bar(hr.index, hr.values)
-    ax.axhline(1.0)
-    ax.set_yscale("log")
-    ax.set_title("Hazard Ratios")
-    fig.tight_layout()
-    st.pyplot(fig)
+    if graph == "Histogram":
+        feat = st.selectbox("Feature", FEATURE_COLS)
+        fig, ax = plt.subplots()
+        ax.hist(df[feat], bins=30)
+        ax.set_title(feat)
+        fig.tight_layout()
+        st.pyplot(fig)
 
-# Risk Distribution
-elif graph_choice == "Risk Distribution":
-    risk = cph.predict_partial_hazard(df_scaled[FEATURE_COLS])
-    fig, ax = plt.subplots()
-    ax.hist(risk, bins=40)
-    ax.set_title("Predicted Risk Distribution")
-    fig.tight_layout()
-    st.pyplot(fig)
+    elif graph == "Correlation":
+        corr = df[FEATURE_COLS].corr()
+        fig, ax = plt.subplots(figsize=(4.8, 3))
+        im = ax.imshow(corr.values, vmin=-1, vmax=1)
+        ax.set_xticks(range(len(FEATURE_COLS)))
+        ax.set_yticks(range(len(FEATURE_COLS)))
+        ax.set_xticklabels(FEATURE_COLS, rotation=45, ha="right")
+        ax.set_yticklabels(FEATURE_COLS)
+        fig.colorbar(im)
+        fig.tight_layout()
+        st.pyplot(fig)
 
-st.divider()
+    elif graph == "KM Overall":
+        kmf = KaplanMeierFitter()
+        fig, ax = plt.subplots()
+        kmf.fit(df[DURATION_COL], df[EVENT_COL])
+        kmf.plot(ax=ax)
+        ax.set_title("Overall Survival")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-# =========================
-# 3) Chat
-# =========================
-st.header("Chat")
+    elif graph == "KM Split":
+        feat = st.selectbox("Split Feature", FEATURE_COLS)
+        med = df[feat].median()
+        high = df[df[feat] >= med]
+        low = df[df[feat] < med]
 
-if "chat" not in st.session_state:
-    st.session_state.chat = []
+        kmf = KaplanMeierFitter()
+        fig, ax = plt.subplots()
+        kmf.fit(low[DURATION_COL], low[EVENT_COL], label="Low")
+        kmf.plot(ax=ax)
+        kmf.fit(high[DURATION_COL], high[EVENT_COL], label="High")
+        kmf.plot(ax=ax)
+        ax.set_title(feat)
+        fig.tight_layout()
+        st.pyplot(fig)
 
-for role, content in st.session_state.chat:
-    with st.chat_message(role):
-        st.markdown(content)
+    elif graph == "Hazard Ratios":
+        hr = summary["exp(coef)"]
+        fig, ax = plt.subplots()
+        ax.bar(hr.index, hr.values)
+        ax.axhline(1.0)
+        ax.set_yscale("log")
+        ax.set_title("Hazard Ratios")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-user_msg = st.chat_input("Ask about hazard ratios or features...")
-if user_msg:
-    st.session_state.chat.append(("user", user_msg))
-    reply = simple_chat(user_msg, summary)
-    st.session_state.chat.append(("assistant", reply))
-
-    with st.chat_message("assistant"):
-        st.markdown(reply)
+    elif graph == "Risk Distribution":
+        risk = cph.predict_partial_hazard(df_scaled[FEATURE_COLS])
+        fig, ax = plt.subplots()
+        ax.hist(risk, bins=40)
+        ax.set_title("Risk Distribution")
+        fig.tight_layout()
+        st.pyplot(fig)
