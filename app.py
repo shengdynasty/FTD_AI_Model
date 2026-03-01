@@ -289,79 +289,149 @@ with tab_predict:
 # =========================
 with tab_viz:
     st.subheader("Dataset Preview")
-    st.write(f"Showing first {MAX_PREVIEW_ROWS} rows:")
-    st.dataframe(df.head(MAX_PREVIEW_ROWS), use_container_width=True)
+    with st.expander("Show data preview & summary", expanded=False):
+        st.write(f"Showing first {MAX_PREVIEW_ROWS} rows:")
+        st.dataframe(df.head(MAX_PREVIEW_ROWS), use_container_width=True)
 
-    st.subheader("Summary Statistics")
-    st.dataframe(df[FEATURE_COLS + [DURATION_COL, EVENT_COL]].describe(), use_container_width=True)
+        st.subheader("Summary Statistics")
+        st.dataframe(df[FEATURE_COLS + [DURATION_COL, EVENT_COL]].describe(), use_container_width=True)
 
+    st.divider()
+
+    # -----------------------------
+    # 1) Feature distributions (selectable + compact)
+    # -----------------------------
     st.subheader("Feature Distributions")
-    for col in FEATURE_COLS:
-        fig, ax = plt.subplots()
-        ax.hist(df[col].dropna().values, bins=MAX_HIST_BINS)
-        ax.set_title(f"Distribution: {col}")
-        ax.set_xlabel(col)
-        ax.set_ylabel("Count")
-        st.pyplot(fig)
+    c1, c2 = st.columns([1, 1])
 
+    with c1:
+        chosen_feat = st.selectbox("Choose a feature", FEATURE_COLS, index=0)
+    with c2:
+        bins = st.slider("Bins", min_value=10, max_value=80, value=30, step=5)
+
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    ax.hist(df[chosen_feat].dropna().values, bins=bins)
+    ax.set_title(f"Distribution: {chosen_feat}")
+    ax.set_xlabel(chosen_feat)
+    ax.set_ylabel("Count")
+    st.pyplot(fig, use_container_width=False)
+
+    st.divider()
+
+    # -----------------------------
+    # 2) Correlation heatmap (compact + annotated)
+    # -----------------------------
     st.subheader("Correlation Heatmap (Features)")
     corr = df[FEATURE_COLS].corr(numeric_only=True)
-    fig, ax = plt.subplots()
-    im = ax.imshow(corr.values)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    im = ax.imshow(corr.values, vmin=-1, vmax=1)
     ax.set_xticks(range(len(FEATURE_COLS)))
     ax.set_yticks(range(len(FEATURE_COLS)))
     ax.set_xticklabels(FEATURE_COLS, rotation=45, ha="right")
     ax.set_yticklabels(FEATURE_COLS)
-    fig.colorbar(im)
     ax.set_title("Feature Correlations")
-    st.pyplot(fig)
 
-    st.subheader("Kaplan–Meier Survival Curve (Overall)")
+    # annotate cells with correlation values
+    for i in range(len(FEATURE_COLS)):
+        for j in range(len(FEATURE_COLS)):
+            ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    st.pyplot(fig, use_container_width=False)
+
+    st.divider()
+
+    # -----------------------------
+    # 3) Survival curves (KM) with controls
+    # -----------------------------
+    st.subheader("Survival Curves (Kaplan–Meier)")
+
+    km_col1, km_col2 = st.columns([1, 1])
+    with km_col1:
+        split_mode = st.selectbox(
+            "KM plot type",
+            ["Overall", "High vs Low (median split)"],
+            index=1
+        )
+    with km_col2:
+        split_feature = st.selectbox(
+            "Split feature (if using High vs Low)",
+            FEATURE_COLS,
+            index=FEATURE_COLS.index("microglia_contact_time") if "microglia_contact_time" in FEATURE_COLS else 0
+        )
+
     kmf = KaplanMeierFitter()
-    fig, ax = plt.subplots()
-    kmf.fit(durations=df[DURATION_COL], event_observed=df[EVENT_COL], label="All cells")
-    kmf.plot(ax=ax)
-    ax.set_title("Overall Survival Curve")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    if split_mode == "Overall":
+        kmf.fit(durations=df[DURATION_COL], event_observed=df[EVENT_COL], label="All cells")
+        kmf.plot(ax=ax, ci_show=True)
+        ax.set_title("Overall Survival Curve")
+    else:
+        med = df[split_feature].median()
+        high = df[df[split_feature] >= med]
+        low = df[df[split_feature] < med]
+
+        kmf.fit(low[DURATION_COL], low[EVENT_COL], label=f"Low {split_feature} (< median)")
+        kmf.plot(ax=ax, ci_show=True)
+        kmf.fit(high[DURATION_COL], high[EVENT_COL], label=f"High {split_feature} (≥ median)")
+        kmf.plot(ax=ax, ci_show=True)
+
+        ax.set_title(f"Survival by {split_feature} (Median Split)")
+
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("Survival probability")
-    st.pyplot(fig)
+    st.pyplot(fig, use_container_width=True)
 
-    st.subheader("Kaplan–Meier: High vs Low Microglia Contact (Median Split)")
-    med = df["microglia_contact_time"].median()
-    high = df[df["microglia_contact_time"] >= med]
-    low = df[df["microglia_contact_time"] < med]
+    st.divider()
 
-    fig, ax = plt.subplots()
-    kmf.fit(low[DURATION_COL], low[EVENT_COL], label="Low microglia contact")
-    kmf.plot(ax=ax)
-    kmf.fit(high[DURATION_COL], high[EVENT_COL], label="High microglia contact")
-    kmf.plot(ax=ax)
-    ax.set_title("Survival by Microglia Contact")
-    ax.set_xlabel("Time (hours)")
-    ax.set_ylabel("Survival probability")
-    st.pyplot(fig)
+    # -----------------------------
+    # 4) Cox hazard ratios + risk distribution (side-by-side)
+    # -----------------------------
+    st.subheader("Model-Based Visuals")
 
-    st.subheader("Cox Hazard Ratios (Feature Effects)")
-    hr = summary["exp(coef)"].copy()
-    fig, ax = plt.subplots()
-    ax.bar(hr.index, hr.values)
-    ax.axhline(1.0)
-    ax.set_yscale("log")
-    ax.set_title("Hazard Ratios (log scale) — >1 increases risk, <1 protective")
-    ax.set_ylabel("Hazard ratio (exp(coef))")
-    ax.set_xticklabels(hr.index, rotation=45, ha="right")
-    st.pyplot(fig)
+    v1, v2 = st.columns(2)
 
-    st.subheader("Predicted Risk Distribution (Partial Hazard)")
-    # Using standardized features because Cox was fit on df_scaled
-    partial_haz = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
+    with v1:
+        st.markdown("**Cox Hazard Ratios (log scale)**")
+        hr = summary["exp(coef)"].copy()
 
-    fig, ax = plt.subplots()
-    ax.hist(partial_haz, bins=40)
-    ax.set_title("Distribution of Predicted Partial Hazard (Relative Risk)")
-    ax.set_xlabel("Partial hazard")
-    ax.set_ylabel("Count")
-    st.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.bar(hr.index, hr.values)
+        ax.axhline(1.0)
+        ax.set_yscale("log")
+        ax.set_ylabel("Hazard ratio (exp(coef))")
+        ax.set_title(">1 increases risk, <1 protective")
+        ax.set_xticklabels(hr.index, rotation=35, ha="right")
+        st.pyplot(fig, use_container_width=True)
+
+    with v2:
+        st.markdown("**Predicted Risk Distribution (Partial Hazard)**")
+        partial_haz = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
+
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.hist(partial_haz, bins=40)
+        ax.set_title("Partial hazard distribution")
+        ax.set_xlabel("Partial hazard (relative risk)")
+        ax.set_ylabel("Count")
+        st.pyplot(fig, use_container_width=True)
+
+    st.divider()
+
+    # -----------------------------
+    # 5) Optional: show everything (collapsed)
+    # -----------------------------
+    with st.expander("Advanced: Show all feature histograms (bulk)", expanded=False):
+        cols = st.columns(2)
+        for idx, col in enumerate(FEATURE_COLS):
+            fig, ax = plt.subplots(figsize=(6, 3))
+            ax.hist(df[col].dropna().values, bins=30)
+            ax.set_title(col)
+            ax.set_xlabel(col)
+            ax.set_ylabel("Count")
+            cols[idx % 2].pyplot(fig, use_container_width=True)
 
 
 # =========================
