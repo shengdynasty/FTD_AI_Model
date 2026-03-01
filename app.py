@@ -1,8 +1,7 @@
 # app.py
-# Compact single-page FTD Survival App
-# - Upload + Chat (chat bubbles) in sidebar
-# - Predict in main
-# - Visualize with tabs
+# FTD Survival App (Cox model)
+# - Upload CSV in sidebar
+# - Predict + Visualize (tabs) + ChatGPT-style chat on main page
 #
 # Run:
 #   streamlit run app.py
@@ -40,10 +39,8 @@ FEATURE_COLS = [
     "aggregation_slope",
     "microglia_contact_time",
 ]
-
 DURATION_COL = "time_to_failure_hours"
 EVENT_COL = "event_observed"
-
 PENALIZER = 0.05
 
 
@@ -105,103 +102,41 @@ def verbal_prediction(std_features, summary):
 
 
 def simple_chat(msg, summary):
-    msg = msg.lower().strip()
+    msg_l = msg.lower().strip()
 
-    if any(k in msg for k in ["most important", "strongest", "top", "largest effect"]):
+    if any(k in msg_l for k in ["most important", "strongest", "top", "largest effect"]):
         s = summary.copy()
         s["abs"] = s["coef"].abs()
         top = s.sort_values("abs", ascending=False).head(3)
         return f"Strongest predictors: {', '.join(top.index)}."
 
-    if "microglia" in msg:
+    if "microglia" in msg_l:
         hr = float(summary.loc["microglia_contact_time", "exp(coef)"])
-        return f"microglia_contact_time HR={hr:.2f}: more contact → faster failure."
+        coef = float(summary.loc["microglia_contact_time", "coef"])
+        return f"microglia_contact_time (coef={coef:.3f}, HR={hr:.2f}): more contact → faster failure."
 
-    if "aggregation" in msg or "tau" in msg or "tdp" in msg:
+    if "aggregation" in msg_l or "tau" in msg_l or "tdp" in msg_l:
         hr = float(summary.loc["aggregation_slope", "exp(coef)"])
-        return f"aggregation_slope HR={hr:.2f}: higher early aggregation → faster failure."
+        coef = float(summary.loc["aggregation_slope", "coef"])
+        return f"aggregation_slope (coef={coef:.3f}, HR={hr:.2f}): higher early aggregation → faster failure."
 
-    if "calcium" in msg:
+    if "calcium" in msg_l:
         hr = float(summary.loc["calcium_rate", "exp(coef)"])
-        return f"calcium_rate HR={hr:.2f}: HR<1 means higher calcium activity is protective."
+        coef = float(summary.loc["calcium_rate", "coef"])
+        return f"calcium_rate (coef={coef:.3f}, HR={hr:.2f}): HR<1 means higher calcium activity is protective."
 
-    if "neurite" in msg:
+    if "neurite" in msg_l:
         hr = float(summary.loc["neurite_growth", "exp(coef)"])
-        return f"neurite_growth HR={hr:.2f}: mild protective effect if HR<1."
+        coef = float(summary.loc["neurite_growth", "coef"])
+        return f"neurite_growth (coef={coef:.3f}, HR={hr:.2f}): mild protective effect if HR<1."
 
-    if "hazard" in msg or "hr" in msg:
-        return "Hazard ratio (HR) is relative risk over time. HR>1 faster failure; HR<1 slower failure."
+    if "hazard" in msg_l or "hr" in msg_l:
+        return "Hazard ratio (HR) is relative risk over time. HR>1 → faster failure; HR<1 → slower failure."
 
-    return "Ask: 'most important feature?', 'explain microglia', or 'what is hazard ratio?'."
+    if "p-value" in msg_l or "p value" in msg_l:
+        return "p-values quantify evidence the feature effect is non-zero. Smaller p-values imply stronger evidence."
 
-
-def render_sidebar_chat():
-    """
-    Sidebar chat UI using a styled markdown bubble list + input box.
-    (Streamlit's st.chat_message is not supported inside st.sidebar reliably,
-     so we mimic chat bubbles with HTML/CSS in markdown.)
-    """
-    st.sidebar.subheader("Chat")
-
-    # Minimal CSS for bubbles in sidebar
-    st.sidebar.markdown(
-        """
-        <style>
-        .chat-wrap { display: flex; flex-direction: column; gap: 8px; }
-        .bubble {
-            padding: 8px 10px;
-            border-radius: 10px;
-            line-height: 1.25;
-            font-size: 0.88rem;
-            word-wrap: break-word;
-        }
-        .user {
-            background: rgba(80, 160, 255, 0.25);
-            border: 1px solid rgba(80, 160, 255, 0.35);
-            align-self: flex-end;
-        }
-        .assistant {
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            align-self: flex-start;
-        }
-        .meta { opacity: 0.7; font-size: 0.75rem; margin-bottom: 2px; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
-
-    # Show last N messages to keep sidebar compact
-    last_n = 10
-    msgs = st.session_state.chat[-last_n:]
-
-    # Render bubbles
-    html = ['<div class="chat-wrap">']
-    for role, content in msgs:
-        label = "You" if role == "user" else "Assistant"
-        klass = "user" if role == "user" else "assistant"
-        safe = (
-            str(content)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
-        html.append(f'<div><div class="meta">{label}</div><div class="bubble {klass}">{safe}</div></div>')
-    html.append("</div>")
-
-    st.sidebar.markdown("".join(html), unsafe_allow_html=True)
-
-    # Input row
-    user_msg = st.sidebar.text_input("Message", key="sidebar_chat_input", placeholder="Ask about HR, features...")
-    col_send, col_clear = st.sidebar.columns([1, 1])
-    send = col_send.button("Send", key="sidebar_chat_send")
-    clear = col_clear.button("Clear", key="sidebar_chat_clear")
-
-    return user_msg, send, clear
+    return "Ask: “most important feature?”, “explain microglia”, or “what does HR mean?”"
 
 
 # -----------------------------
@@ -210,9 +145,7 @@ def render_sidebar_chat():
 st.set_page_config(layout="centered")
 st.title("FTD Cell Survival Model")
 
-# ==============
-# Sidebar: Upload
-# ==============
+# Sidebar upload
 st.sidebar.header("Data Upload")
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 df = load_dataframe(uploaded_file, DEFAULT_DATA_PATH)
@@ -223,159 +156,154 @@ df[EVENT_COL] = df[EVENT_COL].astype(int)
 
 st.sidebar.caption(f"Rows: {len(df)} | Event rate: {df[EVENT_COL].mean():.2f}")
 
-# Fit model (so chat can reference it too)
+# Fit Cox model (demo fit on full dataset)
 scaler = StandardScaler()
 df_scaled = df.copy()
 df_scaled[FEATURE_COLS] = scaler.fit_transform(df_scaled[FEATURE_COLS])
 
 cph = CoxPHFitter(penalizer=PENALIZER)
-cph.fit(
-    df_scaled[FEATURE_COLS + [DURATION_COL, EVENT_COL]],
-    duration_col=DURATION_COL,
-    event_col=EVENT_COL
-)
+cph.fit(df_scaled[FEATURE_COLS + [DURATION_COL, EVENT_COL]],
+        duration_col=DURATION_COL, event_col=EVENT_COL)
 
 summary = cph.summary.loc[FEATURE_COLS, ["coef", "exp(coef)", "p"]]
 
-st.sidebar.divider()
+# Layout: Predict + Visualize + Chat
+tab_predict, tab_viz, tab_chat = st.tabs(["Predict", "Visualize", "Chat"])
 
-# ==============
-# Sidebar: Chat bubbles
-# ==============
-user_msg, send, clear = render_sidebar_chat()
+# =========================
+# Predict tab
+# =========================
+with tab_predict:
+    col1, col2 = st.columns(2)
 
-if clear:
-    st.session_state.chat = []
-    st.rerun()
+    with col1:
+        st.subheader("Cox Summary")
+        st.dataframe(summary, height=220, use_container_width=True)
 
-if send and user_msg.strip():
-    st.session_state.chat.append(("user", user_msg.strip()))
-    reply = simple_chat(user_msg, summary)
-    st.session_state.chat.append(("assistant", reply))
-    # clear the input field
-    st.session_state["sidebar_chat_input"] = ""
-    st.rerun()
+    with col2:
+        st.subheader("Single-cell verbal prediction")
+        inputs = {f: st.number_input(f, value=float(df[f].mean()), key=f"pred_{f}") for f in FEATURE_COLS}
 
-# ==============
-# Main: Predict
-# ==============
-st.header("Predict")
+        if st.button("Predict", key="predict_btn"):
+            arr = np.array([[inputs[f] for f in FEATURE_COLS]])
+            arr_s = scaler.transform(arr)[0]
+            std = {FEATURE_COLS[i]: float(arr_s[i]) for i in range(len(FEATURE_COLS))}
+            st.markdown(verbal_prediction(std, summary))
 
-col1, col2 = st.columns(2)
+# =========================
+# Visualize tab
+# =========================
+with tab_viz:
+    tab_hist, tab_corr, tab_km, tab_km_split, tab_hr, tab_risk = st.tabs([
+        "Histogram", "Correlation", "KM Overall", "KM Split", "Hazard Ratios", "Risk Dist."
+    ])
 
-with col1:
-    st.subheader("Cox Summary")
-    st.dataframe(summary, height=220, use_container_width=True)
+    with tab_hist:
+        feat = st.selectbox("Feature", FEATURE_COLS, key="hist_feat")
+        bins = st.slider("Bins", 10, 80, 30, 5, key="hist_bins")
 
-with col2:
-    st.subheader("Single-cell verbal prediction")
-    inputs = {f: st.number_input(f, value=float(df[f].mean())) for f in FEATURE_COLS}
+        fig, ax = plt.subplots(figsize=(5.2, 2.6))
+        ax.hist(df[feat].dropna(), bins=bins)
+        ax.set_title(f"Histogram: {feat}")
+        ax.set_xlabel(feat)
+        ax.set_ylabel("Count")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-    if st.button("Predict"):
-        arr = np.array([[inputs[f] for f in FEATURE_COLS]])
-        arr_s = scaler.transform(arr)[0]
-        std = {FEATURE_COLS[i]: float(arr_s[i]) for i in range(len(FEATURE_COLS))}
-        st.markdown(verbal_prediction(std, summary))
+    with tab_corr:
+        corr = df[FEATURE_COLS].corr()
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        im = ax.imshow(corr.values, vmin=-1, vmax=1)
+        ax.set_xticks(range(len(FEATURE_COLS)))
+        ax.set_yticks(range(len(FEATURE_COLS)))
+        ax.set_xticklabels(FEATURE_COLS, rotation=45, ha="right")
+        ax.set_yticklabels(FEATURE_COLS)
+        ax.set_title("Correlation Heatmap")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        st.pyplot(fig)
 
-st.divider()
+    with tab_km:
+        kmf = KaplanMeierFitter()
+        fig, ax = plt.subplots(figsize=(5.8, 3.1))
+        kmf.fit(df[DURATION_COL], df[EVENT_COL], label="All")
+        kmf.plot(ax=ax, ci_show=True)
+        ax.set_title("Kaplan–Meier (Overall)")
+        ax.set_xlabel("Time (hours)")
+        ax.set_ylabel("Survival")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-# ==============
-# Main: Visualize (TABS)
-# ==============
-st.header("Visualize")
+    with tab_km_split:
+        feat = st.selectbox("Split Feature", FEATURE_COLS,
+                            index=FEATURE_COLS.index("microglia_contact_time"),
+                            key="km_split_feat")
+        med = df[feat].median()
+        high = df[df[feat] >= med]
+        low = df[df[feat] < med]
 
-tab_hist, tab_corr, tab_km, tab_km_split, tab_hr, tab_risk = st.tabs([
-    "Histogram",
-    "Correlation",
-    "KM Overall",
-    "KM Split",
-    "Hazard Ratios",
-    "Risk Dist."
-])
+        kmf = KaplanMeierFitter()
+        fig, ax = plt.subplots(figsize=(5.8, 3.1))
+        kmf.fit(low[DURATION_COL], low[EVENT_COL], label="Low")
+        kmf.plot(ax=ax, ci_show=True)
+        kmf.fit(high[DURATION_COL], high[EVENT_COL], label="High")
+        kmf.plot(ax=ax, ci_show=True)
+        ax.set_title(f"KM Split by {feat}")
+        ax.set_xlabel("Time (hours)")
+        ax.set_ylabel("Survival")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-with tab_hist:
-    feat = st.selectbox("Feature", FEATURE_COLS, key="hist_feat")
-    bins = st.slider("Bins", 10, 80, 30, 5, key="hist_bins")
+    with tab_hr:
+        hr = summary["exp(coef)"]
+        fig, ax = plt.subplots(figsize=(5.6, 3.0))
+        ax.bar(hr.index, hr.values)
+        ax.axhline(1.0)
+        ax.set_yscale("log")
+        ax.set_title("Hazard Ratios (log)")
+        ax.set_ylabel("HR")
+        ax.set_xticklabels(hr.index, rotation=25, ha="right")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-    fig, ax = plt.subplots(figsize=(5.2, 2.6))
-    ax.hist(df[feat].dropna(), bins=bins)
-    ax.set_title(f"Histogram: {feat}")
-    ax.set_xlabel(feat)
-    ax.set_ylabel("Count")
-    fig.tight_layout()
-    st.pyplot(fig)
+    with tab_risk:
+        risk = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
+        bins = st.slider("Bins", 10, 120, 40, 5, key="risk_bins")
+        fig, ax = plt.subplots(figsize=(5.6, 3.0))
+        ax.hist(risk, bins=bins)
+        ax.set_title("Predicted Risk (Partial Hazard)")
+        ax.set_xlabel("Partial hazard")
+        ax.set_ylabel("Count")
+        fig.tight_layout()
+        st.pyplot(fig)
 
-with tab_corr:
-    corr = df[FEATURE_COLS].corr()
-    fig, ax = plt.subplots(figsize=(5.2, 3.2))
-    im = ax.imshow(corr.values, vmin=-1, vmax=1)
-    ax.set_xticks(range(len(FEATURE_COLS)))
-    ax.set_yticks(range(len(FEATURE_COLS)))
-    ax.set_xticklabels(FEATURE_COLS, rotation=45, ha="right")
-    ax.set_yticklabels(FEATURE_COLS)
-    ax.set_title("Correlation Heatmap")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    st.pyplot(fig)
+# =========================
+# Chat tab (ChatGPT style)
+# =========================
+with tab_chat:
+    st.subheader("Chat")
+    st.caption("ChatGPT-style UI (local assistant, no API).")
 
-with tab_km:
-    kmf = KaplanMeierFitter()
-    fig, ax = plt.subplots(figsize=(5.8, 3.1))
-    kmf.fit(df[DURATION_COL], df[EVENT_COL], label="All")
-    kmf.plot(ax=ax, ci_show=True)
-    ax.set_title("Kaplan–Meier (Overall)")
-    ax.set_xlabel("Time (hours)")
-    ax.set_ylabel("Survival")
-    fig.tight_layout()
-    st.pyplot(fig)
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Ask me about hazard ratios, feature effects, or which predictors are strongest."}
+        ]
 
-with tab_km_split:
-    feat = st.selectbox(
-        "Split Feature",
-        FEATURE_COLS,
-        index=FEATURE_COLS.index("microglia_contact_time"),
-        key="km_split_feat"
-    )
-    med = df[feat].median()
-    high = df[df[feat] >= med]
-    low = df[df[feat] < med]
+    # Render history
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-    kmf = KaplanMeierFitter()
-    fig, ax = plt.subplots(figsize=(5.8, 3.1))
+    prompt = st.chat_input("Message the model assistant...")
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    kmf.fit(low[DURATION_COL], low[EVENT_COL], label="Low")
-    kmf.plot(ax=ax, ci_show=True)
-    kmf.fit(high[DURATION_COL], high[EVENT_COL], label="High")
-    kmf.plot(ax=ax, ci_show=True)
+        reply = simple_chat(prompt, summary)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
 
-    ax.set_title(f"KM Split by {feat}")
-    ax.set_xlabel("Time (hours)")
-    ax.set_ylabel("Survival")
-    fig.tight_layout()
-    st.pyplot(fig)
-
-with tab_hr:
-    hr = summary["exp(coef)"]
-    fig, ax = plt.subplots(figsize=(5.6, 3.0))
-    ax.bar(hr.index, hr.values)
-    ax.axhline(1.0)
-    ax.set_yscale("log")
-    ax.set_title("Hazard Ratios (log)")
-    ax.set_ylabel("HR")
-    ax.set_xticklabels(hr.index, rotation=25, ha="right")
-    fig.tight_layout()
-    st.pyplot(fig)
-
-with tab_risk:
-    risk = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
-    bins = st.slider("Bins", 10, 120, 40, 5, key="risk_bins")
-
-    fig, ax = plt.subplots(figsize=(5.6, 3.0))
-    ax.hist(risk, bins=bins)
-    ax.set_title("Predicted Risk (Partial Hazard)")
-    ax.set_xlabel("Partial hazard")
-    ax.set_ylabel("Count")
-    fig.tight_layout()
-    st.pyplot(fig)
+        with st.chat_message("assistant"):
+            st.markdown(reply)
 
 st.caption("Note: Cox predicts relative hazard over time. Exact time prediction needs calibration.")
