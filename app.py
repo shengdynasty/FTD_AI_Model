@@ -1,5 +1,5 @@
 # app.py
-# Streamlit app: Upload CSV -> Fit Cox survival model -> Visualize data -> Verbal predictions -> Local chat assistant
+# Single-page Streamlit app: Upload CSV -> Cox survival model -> Predict + Visualize (dropdown) + Chat
 #
 # Run:
 #   streamlit run app.py
@@ -9,7 +9,7 @@
 #   time_to_failure_hours, event_observed
 #
 # Optional:
-#   donor_id (not required for this app, but nice to have)
+#   donor_id (not required)
 
 import os
 import math
@@ -20,6 +20,11 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler
 from lifelines import CoxPHFitter, KaplanMeierFitter
+
+# -----------------------------
+# Dark theme for all matplotlib plots
+# -----------------------------
+plt.style.use("dark_background")
 
 
 # =========================
@@ -39,14 +44,12 @@ EVENT_COL = "event_observed"
 
 PENALIZER = 0.05
 MAX_PREVIEW_ROWS = 50
-MAX_HIST_BINS = 30
 
 
 # =========================
 # HELPERS
 # =========================
 def load_dataframe(uploaded_file, fallback_path: str) -> pd.DataFrame:
-    """Load uploaded CSV if provided; otherwise load local fallback."""
     if uploaded_file is not None:
         try:
             return pd.read_csv(uploaded_file)
@@ -57,7 +60,7 @@ def load_dataframe(uploaded_file, fallback_path: str) -> pd.DataFrame:
     if not os.path.exists(fallback_path):
         st.error(
             f"Could not find `{fallback_path}` and no CSV was uploaded.\n\n"
-            "Upload a CSV using the sidebar, or place `cell_data.csv` in the same folder as app.py."
+            "Upload a CSV using the sidebar, or place `cell_data.csv` next to app.py."
         )
         st.stop()
 
@@ -82,7 +85,6 @@ def validate_columns(df: pd.DataFrame) -> None:
 
 
 def describe_effects(cox_summary: pd.DataFrame) -> str:
-    """Readable summary of coefficients/hazard ratios."""
     lines = []
     for feat, row in cox_summary.iterrows():
         coef = float(row["coef"])
@@ -96,20 +98,13 @@ def describe_effects(cox_summary: pd.DataFrame) -> str:
 
 
 def verbal_prediction(standardized_features: dict, cox_summary: pd.DataFrame) -> tuple[str, float, str]:
-    """
-    Turn a single sample into a natural language prediction.
-    Returns: (markdown_text, relative_risk, bucket)
-    """
     coefs = cox_summary["coef"].to_dict()
-
-    # Contributions in Cox are coef * x (standardized)
     contribs = {k: coefs[k] * float(standardized_features[k]) for k in FEATURE_COLS}
     sorted_feats = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)
 
     lin_pred = sum(contribs.values())
     rel_risk = math.exp(lin_pred)
 
-    # Friendly bucket thresholds (heuristic)
     if rel_risk >= 2.0:
         bucket = "HIGH"
     elif rel_risk >= 1.2:
@@ -140,7 +135,6 @@ def verbal_prediction(standardized_features: dict, cox_summary: pd.DataFrame) ->
 
 
 def simple_local_chat(user_msg: str, cox_summary: pd.DataFrame) -> str:
-    """Local assistant (no API): answers using Cox summary + rule-based explanations."""
     msg = user_msg.lower().strip()
 
     if any(k in msg for k in ["most important", "strongest", "top feature", "largest effect"]):
@@ -182,12 +176,12 @@ def simple_local_chat(user_msg: str, cox_summary: pd.DataFrame) -> str:
             f"HR slightly below 1 suggests neurite growth is mildly protective."
         )
 
-    if "hazard ratio" in msg or "hr" in msg or "what is hazard" in msg:
+    if "hazard ratio" in msg or msg == "hr" or "what is hazard" in msg:
         return (
             "**Hazard ratio (HR)** is a relative risk over time.\n\n"
-            "- HR > 1: higher values of that feature → faster failure\n"
-            "- HR < 1: higher values of that feature → slower failure\n\n"
-            "In a Cox model, these effects are *multiplicative* on the hazard."
+            "- HR > 1: higher feature values → faster failure\n"
+            "- HR < 1: higher feature values → slower failure\n\n"
+            "In a Cox model, effects are multiplicative on hazard."
         )
 
     if "p value" in msg or "p-value" in msg:
@@ -210,9 +204,9 @@ def simple_local_chat(user_msg: str, cox_summary: pd.DataFrame) -> str:
 # =========================
 st.set_page_config(page_title="FTD Cell Failure Predictor", layout="wide")
 st.title("FTD Cell-Level Failure Predictor")
-st.caption("Survival modeling + visualizations + verbal interpretation + local chat (no API)")
+st.caption("Single page: Predict + Visualize (dropdown) + Chat | Dark-themed plots | No external API")
 
-# Sidebar: upload
+# Sidebar: upload CSV
 st.sidebar.header("Data")
 uploaded_file = st.sidebar.file_uploader("Upload a CSV", type=["csv"])
 df = load_dataframe(uploaded_file, DEFAULT_DATA_PATH)
@@ -225,10 +219,7 @@ validate_columns(df)
 df = df.dropna(subset=FEATURE_COLS + [DURATION_COL, EVENT_COL]).copy()
 df[EVENT_COL] = df[EVENT_COL].astype(int)
 
-# Tabs
-tab_predict, tab_viz, tab_chat = st.tabs(["Predict", "Visualizations", "Chat"])
-
-# Fit scaler + Cox on full data (demo). For strict research, fit on train split only.
+# Fit scaler + Cox (demo: fit on full data)
 scaler = StandardScaler()
 df_scaled = df.copy()
 df_scaled[FEATURE_COLS] = scaler.fit_transform(df_scaled[FEATURE_COLS])
@@ -239,92 +230,87 @@ cph.fit(df_scaled[FEATURE_COLS + [DURATION_COL, EVENT_COL]],
 
 summary = cph.summary.loc[FEATURE_COLS, ["coef", "exp(coef)", "p"]]
 
+# =========================
+# SECTION 1: PREDICT
+# =========================
+st.header("1) Predict")
+
+colA, colB = st.columns([1.1, 1.0], gap="large")
+
+with colA:
+    st.subheader("Cox Model Summary")
+    st.dataframe(summary, use_container_width=True)
+    st.markdown("#### Quick interpretation")
+    st.markdown(describe_effects(summary))
+
+with colB:
+    st.subheader("Single-cell verbal prediction")
+    st.write("Enter raw feature values (the app standardizes internally).")
+
+    raw_inputs = {
+        "neurite_growth": st.number_input("neurite_growth", value=float(df["neurite_growth"].mean())),
+        "calcium_rate": st.number_input("calcium_rate", value=float(df["calcium_rate"].mean())),
+        "aggregation_slope": st.number_input("aggregation_slope", value=float(df["aggregation_slope"].mean())),
+        "microglia_contact_time": st.number_input("microglia_contact_time", value=float(df["microglia_contact_time"].mean())),
+    }
+
+    if st.button("Predict risk (verbal)"):
+        arr = np.array([[raw_inputs[c] for c in FEATURE_COLS]])
+        arr_s = scaler.transform(arr)[0]
+        standardized = {FEATURE_COLS[i]: float(arr_s[i]) for i in range(len(FEATURE_COLS))}
+
+        md, rel_risk, bucket = verbal_prediction(standardized, summary)
+        st.markdown(md)
+
+        input_df = pd.DataFrame([standardized])
+        partial_hazard = float(cph.predict_partial_hazard(input_df)[0])
+        st.markdown(f"**Cox predicted partial hazard:** `{partial_hazard:.3f}` (relative risk scale)")
+
+st.divider()
 
 # =========================
-# TAB: PREDICT
+# SECTION 2: VISUALIZE (dropdown)
 # =========================
-with tab_predict:
-    left, right = st.columns([1, 1])
+st.header("2) Visualize")
+st.caption("Choose a graph from the dropdown. Only one chart is shown at a time for readability.")
 
-    with left:
-        st.subheader("Cox Model Summary")
-        st.dataframe(summary, use_container_width=True)
-        st.markdown("#### Quick interpretation")
-        st.markdown(describe_effects(summary))
+# Optional: preview in expander
+with st.expander("Preview data + stats", expanded=False):
+    st.write(f"Showing first {MAX_PREVIEW_ROWS} rows:")
+    st.dataframe(df.head(MAX_PREVIEW_ROWS), use_container_width=True)
+    st.subheader("Summary Statistics")
+    st.dataframe(df[FEATURE_COLS + [DURATION_COL, EVENT_COL]].describe(), use_container_width=True)
 
-    with right:
-        st.subheader("Single-cell verbal prediction")
-        st.write("Enter a cell’s **raw feature values** (the app standardizes them internally).")
+graph_options = [
+    "Feature distribution (histogram)",
+    "Feature correlation heatmap",
+    "Kaplan–Meier survival (overall)",
+    "Kaplan–Meier survival (high vs low, choose feature)",
+    "Cox hazard ratios (bar, log scale)",
+    "Predicted risk distribution (partial hazard)",
+]
+graph_choice = st.selectbox("Select a graph to display", graph_options, index=0)
 
-        raw_inputs = {}
-        raw_inputs["neurite_growth"] = st.number_input(
-            "neurite_growth", value=float(df["neurite_growth"].mean())
-        )
-        raw_inputs["calcium_rate"] = st.number_input(
-            "calcium_rate", value=float(df["calcium_rate"].mean())
-        )
-        raw_inputs["aggregation_slope"] = st.number_input(
-            "aggregation_slope", value=float(df["aggregation_slope"].mean())
-        )
-        raw_inputs["microglia_contact_time"] = st.number_input(
-            "microglia_contact_time", value=float(df["microglia_contact_time"].mean())
-        )
-
-        if st.button("Predict risk (verbal)"):
-            arr = np.array([[raw_inputs[c] for c in FEATURE_COLS]])
-            arr_s = scaler.transform(arr)[0]
-            standardized = {FEATURE_COLS[i]: float(arr_s[i]) for i in range(len(FEATURE_COLS))}
-
-            md, rel_risk, bucket = verbal_prediction(standardized, summary)
-            st.markdown(md)
-
-            # Cox partial hazard (relative hazard). cph expects standardized features.
-            input_df = pd.DataFrame([standardized])
-            partial_hazard = float(cph.predict_partial_hazard(input_df)[0])
-            st.markdown(f"**Cox predicted partial hazard:** `{partial_hazard:.3f}` (relative risk scale)")
-
-
-# =========================
-# TAB: VISUALIZATIONS
-# =========================
-with tab_viz:
-    st.subheader("Dataset Preview")
-    with st.expander("Show data preview & summary", expanded=False):
-        st.write(f"Showing first {MAX_PREVIEW_ROWS} rows:")
-        st.dataframe(df.head(MAX_PREVIEW_ROWS), use_container_width=True)
-
-        st.subheader("Summary Statistics")
-        st.dataframe(df[FEATURE_COLS + [DURATION_COL, EVENT_COL]].describe(), use_container_width=True)
-
-    st.divider()
-
-    # -----------------------------
-    # 1) Feature distributions (selectable + compact)
-    # -----------------------------
-    st.subheader("Feature Distributions")
+# ---- Graph 1: histogram
+if graph_choice == "Feature distribution (histogram)":
     c1, c2 = st.columns([1, 1])
-
     with c1:
-        chosen_feat = st.selectbox("Choose a feature", FEATURE_COLS, index=0)
+        feat = st.selectbox("Feature", FEATURE_COLS, index=0)
     with c2:
         bins = st.slider("Bins", min_value=10, max_value=80, value=30, step=5)
 
-    fig, ax = plt.subplots(figsize=(6, 3.2))
-    ax.hist(df[chosen_feat].dropna().values, bins=bins)
-    ax.set_title(f"Distribution: {chosen_feat}")
-    ax.set_xlabel(chosen_feat)
+    fig, ax = plt.subplots(figsize=(7, 3.6))
+    ax.hist(df[feat].dropna().values, bins=bins)
+    ax.set_title(f"Distribution: {feat}")
+    ax.set_xlabel(feat)
     ax.set_ylabel("Count")
-    st.pyplot(fig, use_container_width=False)
+    st.pyplot(fig, use_container_width=True)
 
-    st.divider()
-
-    # -----------------------------
-    # 2) Correlation heatmap (compact + annotated)
-    # -----------------------------
-    st.subheader("Correlation Heatmap (Features)")
+# ---- Graph 2: correlation heatmap (annotated)
+elif graph_choice == "Feature correlation heatmap":
     corr = df[FEATURE_COLS].corr(numeric_only=True)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(7, 5))
     im = ax.imshow(corr.values, vmin=-1, vmax=1)
     ax.set_xticks(range(len(FEATURE_COLS)))
     ax.set_yticks(range(len(FEATURE_COLS)))
@@ -332,133 +318,95 @@ with tab_viz:
     ax.set_yticklabels(FEATURE_COLS)
     ax.set_title("Feature Correlations")
 
-    # annotate cells with correlation values
     for i in range(len(FEATURE_COLS)):
         for j in range(len(FEATURE_COLS)):
             ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
 
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    st.pyplot(fig, use_container_width=False)
+    st.pyplot(fig, use_container_width=True)
 
-    st.divider()
-
-    # -----------------------------
-    # 3) Survival curves (KM) with controls
-    # -----------------------------
-    st.subheader("Survival Curves (Kaplan–Meier)")
-
-    km_col1, km_col2 = st.columns([1, 1])
-    with km_col1:
-        split_mode = st.selectbox(
-            "KM plot type",
-            ["Overall", "High vs Low (median split)"],
-            index=1
-        )
-    with km_col2:
-        split_feature = st.selectbox(
-            "Split feature (if using High vs Low)",
-            FEATURE_COLS,
-            index=FEATURE_COLS.index("microglia_contact_time") if "microglia_contact_time" in FEATURE_COLS else 0
-        )
-
+# ---- Graph 3: KM overall
+elif graph_choice == "Kaplan–Meier survival (overall)":
     kmf = KaplanMeierFitter()
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-
-    if split_mode == "Overall":
-        kmf.fit(durations=df[DURATION_COL], event_observed=df[EVENT_COL], label="All cells")
-        kmf.plot(ax=ax, ci_show=True)
-        ax.set_title("Overall Survival Curve")
-    else:
-        med = df[split_feature].median()
-        high = df[df[split_feature] >= med]
-        low = df[df[split_feature] < med]
-
-        kmf.fit(low[DURATION_COL], low[EVENT_COL], label=f"Low {split_feature} (< median)")
-        kmf.plot(ax=ax, ci_show=True)
-        kmf.fit(high[DURATION_COL], high[EVENT_COL], label=f"High {split_feature} (≥ median)")
-        kmf.plot(ax=ax, ci_show=True)
-
-        ax.set_title(f"Survival by {split_feature} (Median Split)")
-
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    kmf.fit(durations=df[DURATION_COL], event_observed=df[EVENT_COL], label="All cells")
+    kmf.plot(ax=ax, ci_show=True)
+    ax.set_title("Overall Survival Curve")
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("Survival probability")
     st.pyplot(fig, use_container_width=True)
 
-    st.divider()
+# ---- Graph 4: KM split
+elif graph_choice == "Kaplan–Meier survival (high vs low, choose feature)":
+    split_feat = st.selectbox("Split feature", FEATURE_COLS, index=FEATURE_COLS.index("microglia_contact_time"))
+    med = df[split_feat].median()
+    high = df[df[split_feat] >= med]
+    low = df[df[split_feat] < med]
 
-    # -----------------------------
-    # 4) Cox hazard ratios + risk distribution (side-by-side)
-    # -----------------------------
-    st.subheader("Model-Based Visuals")
+    kmf = KaplanMeierFitter()
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
 
-    v1, v2 = st.columns(2)
+    kmf.fit(low[DURATION_COL], low[EVENT_COL], label=f"Low {split_feat} (< median)")
+    kmf.plot(ax=ax, ci_show=True)
+    kmf.fit(high[DURATION_COL], high[EVENT_COL], label=f"High {split_feat} (≥ median)")
+    kmf.plot(ax=ax, ci_show=True)
 
-    with v1:
-        st.markdown("**Cox Hazard Ratios (log scale)**")
-        hr = summary["exp(coef)"].copy()
+    ax.set_title(f"Survival by {split_feat} (Median Split)")
+    ax.set_xlabel("Time (hours)")
+    ax.set_ylabel("Survival probability")
+    st.pyplot(fig, use_container_width=True)
 
-        fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.bar(hr.index, hr.values)
-        ax.axhline(1.0)
-        ax.set_yscale("log")
-        ax.set_ylabel("Hazard ratio (exp(coef))")
-        ax.set_title(">1 increases risk, <1 protective")
-        ax.set_xticklabels(hr.index, rotation=35, ha="right")
-        st.pyplot(fig, use_container_width=True)
+# ---- Graph 5: Cox hazard ratios
+elif graph_choice == "Cox hazard ratios (bar, log scale)":
+    hr = summary["exp(coef)"].copy()
 
-    with v2:
-        st.markdown("**Predicted Risk Distribution (Partial Hazard)**")
-        partial_haz = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
+    fig, ax = plt.subplots(figsize=(7.5, 4.0))
+    ax.bar(hr.index, hr.values)
+    ax.axhline(1.0)
+    ax.set_yscale("log")
+    ax.set_title("Hazard Ratios (log scale) — >1 increases risk, <1 protective")
+    ax.set_ylabel("Hazard ratio (exp(coef))")
+    ax.set_xticklabels(hr.index, rotation=25, ha="right")
+    st.pyplot(fig, use_container_width=True)
 
-        fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.hist(partial_haz, bins=40)
-        ax.set_title("Partial hazard distribution")
-        ax.set_xlabel("Partial hazard (relative risk)")
-        ax.set_ylabel("Count")
-        st.pyplot(fig, use_container_width=True)
+# ---- Graph 6: risk distribution
+elif graph_choice == "Predicted risk distribution (partial hazard)":
+    partial_haz = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
+    bins = st.slider("Bins", min_value=10, max_value=120, value=40, step=5)
 
-    st.divider()
+    fig, ax = plt.subplots(figsize=(7.5, 4.0))
+    ax.hist(partial_haz, bins=bins)
+    ax.set_title("Distribution of Predicted Partial Hazard (Relative Risk)")
+    ax.set_xlabel("Partial hazard")
+    ax.set_ylabel("Count")
+    st.pyplot(fig, use_container_width=True)
 
-    # -----------------------------
-    # 5) Optional: show everything (collapsed)
-    # -----------------------------
-    with st.expander("Advanced: Show all feature histograms (bulk)", expanded=False):
-        cols = st.columns(2)
-        for idx, col in enumerate(FEATURE_COLS):
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.hist(df[col].dropna().values, bins=30)
-            ax.set_title(col)
-            ax.set_xlabel(col)
-            ax.set_ylabel("Count")
-            cols[idx % 2].pyplot(fig, use_container_width=True)
-
+st.divider()
 
 # =========================
-# TAB: CHAT
+# SECTION 3: CHAT
 # =========================
-with tab_chat:
-    st.subheader("Chat with the model assistant")
-    st.caption("This assistant answers using the Cox model summary (no external API).")
+st.header("3) Chat")
+st.caption("Local assistant uses the Cox summary (no external API).")
 
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
+if "chat" not in st.session_state:
+    st.session_state.chat = []
 
-    for role, content in st.session_state.chat:
-        with st.chat_message(role):
-            st.markdown(content)
+for role, content in st.session_state.chat:
+    with st.chat_message(role):
+        st.markdown(content)
 
-    user_msg = st.chat_input("Ask about hazard ratios, p-values, or specific features...")
-    if user_msg:
-        st.session_state.chat.append(("user", user_msg))
-        with st.chat_message("user"):
-            st.markdown(user_msg)
+user_msg = st.chat_input("Ask about hazard ratios, p-values, or specific features...")
+if user_msg:
+    st.session_state.chat.append(("user", user_msg))
+    with st.chat_message("user"):
+        st.markdown(user_msg)
 
-        reply = simple_local_chat(user_msg, summary)
+    reply = simple_local_chat(user_msg, summary)
 
-        with st.chat_message("assistant"):
-            st.markdown(reply)
+    with st.chat_message("assistant"):
+        st.markdown(reply)
 
-        st.session_state.chat.append(("assistant", reply))
+    st.session_state.chat.append(("assistant", reply))
 
-st.caption("Note: Cox models predict relative hazard over time. Exact time prediction requires calibration or additional modeling.")
+st.caption("Note: Cox models predict relative hazard over time. Exact time prediction needs calibration or additional modeling.")
