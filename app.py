@@ -1,26 +1,31 @@
+# app.py
+# Streamlit app: Upload CSV -> Fit Cox survival model -> Visualize data -> Verbal predictions -> Local chat assistant
+#
+# Run:
+#   streamlit run app.py
+#
+# Expected CSV columns (survival mode):
+#   neurite_growth, calcium_rate, aggregation_slope, microglia_contact_time,
+#   time_to_failure_hours, event_observed
+#
+# Optional:
+#   donor_id (not required for this app, but nice to have)
+
 import os
 import math
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
-from lifelines import CoxPHFitter
 from sklearn.preprocessing import StandardScaler
+from lifelines import CoxPHFitter, KaplanMeierFitter
 
-# Optional: OpenAI chat 
-"""
-USE_OPENAI = False
-try:
-    from openai import OpenAI
-    USE_OPENAI = True
-except Exception:
-    USE_OPENAI = False
 
-"""
 # =========================
 # CONFIG
 # =========================
-DATA_PATH = "cell_data.csv"
+DEFAULT_DATA_PATH = "cell_data.csv"
 
 FEATURE_COLS = [
     "neurite_growth",
@@ -31,29 +36,53 @@ FEATURE_COLS = [
 
 DURATION_COL = "time_to_failure_hours"
 EVENT_COL = "event_observed"
-GROUP_COL = "donor_id"
 
-# Cox model penalizer for stability
 PENALIZER = 0.05
+MAX_PREVIEW_ROWS = 50
+MAX_HIST_BINS = 30
 
 
 # =========================
-# HELPER FUNCTIONS
+# HELPERS
 # =========================
-def safe_sigmoid(x: float) -> float:
-    # stable sigmoid
-    if x >= 0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    else:
-        z = math.exp(x)
-        return z / (1.0 + z)
+def load_dataframe(uploaded_file, fallback_path: str) -> pd.DataFrame:
+    """Load uploaded CSV if provided; otherwise load local fallback."""
+    if uploaded_file is not None:
+        try:
+            return pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"Failed to read uploaded CSV: {e}")
+            st.stop()
+
+    if not os.path.exists(fallback_path):
+        st.error(
+            f"Could not find `{fallback_path}` and no CSV was uploaded.\n\n"
+            "Upload a CSV using the sidebar, or place `cell_data.csv` in the same folder as app.py."
+        )
+        st.stop()
+
+    try:
+        return pd.read_csv(fallback_path)
+    except Exception as e:
+        st.error(f"Failed to read `{fallback_path}`: {e}")
+        st.stop()
+
+
+def validate_columns(df: pd.DataFrame) -> None:
+    required = FEATURE_COLS + [DURATION_COL, EVENT_COL]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(
+            "CSV is missing required columns:\n\n"
+            + "\n".join([f"- {c}" for c in missing])
+            + "\n\nExpected at minimum:\n"
+            + "\n".join([f"- {c}" for c in required])
+        )
+        st.stop()
 
 
 def describe_effects(cox_summary: pd.DataFrame) -> str:
-    """
-    Create a readable summary of coefficients/hazard ratios.
-    """
+    """Readable summary of coefficients/hazard ratios."""
     lines = []
     for feat, row in cox_summary.iterrows():
         coef = float(row["coef"])
@@ -66,28 +95,21 @@ def describe_effects(cox_summary: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def verbal_prediction(input_features: dict, cox_summary: pd.DataFrame) -> str:
+def verbal_prediction(standardized_features: dict, cox_summary: pd.DataFrame) -> tuple[str, float, str]:
     """
     Turn a single sample into a natural language prediction.
-    We use:
-      - risk score approximation: sum(coef * standardized_feature)
-      - top contributing factors (by absolute contribution)
-    Note: Cox model predicts relative risk (hazard), not exact time by itself.
+    Returns: (markdown_text, relative_risk, bucket)
     """
-
-    # Get coefficients
     coefs = cox_summary["coef"].to_dict()
 
-    # Compute contributions (we assume input features are already standardized)
-    contribs = {k: coefs[k] * input_features[k] for k in FEATURE_COLS}
+    # Contributions in Cox are coef * x (standardized)
+    contribs = {k: coefs[k] * float(standardized_features[k]) for k in FEATURE_COLS}
     sorted_feats = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)
 
-    # Relative risk proxy = exp(sum(contrib))
     lin_pred = sum(contribs.values())
     rel_risk = math.exp(lin_pred)
 
-    # Convert to a friendly bucket (purely descriptive)
-    # (These thresholds are heuristic—good enough for a demo.)
+    # Friendly bucket thresholds (heuristic)
     if rel_risk >= 2.0:
         bucket = "HIGH"
     elif rel_risk >= 1.2:
@@ -98,9 +120,9 @@ def verbal_prediction(input_features: dict, cox_summary: pd.DataFrame) -> str:
     top_factors = []
     for feat, val in sorted_feats[:3]:
         direction = "raises" if val > 0 else "lowers"
-        top_factors.append(f"{feat} **{direction}** risk")
+        top_factors.append(f"**{feat}** {direction} risk")
 
-    text = f"""
+    md = f"""
 ### Verbal risk prediction
 **Relative risk (hazard) estimate:** `{rel_risk:.2f}×` baseline  
 **Risk bucket:** **{bucket}** (higher = likely faster failure)
@@ -110,21 +132,18 @@ def verbal_prediction(input_features: dict, cox_summary: pd.DataFrame) -> str:
 - {top_factors[1]}
 - {top_factors[2]}
 
-**Interpretation tip:**  
+**How to read this:**  
 - Positive contributions push toward **faster failure**  
 - Negative contributions push toward **slower failure**
 """
-    return text
+    return md, rel_risk, bucket
 
 
 def simple_local_chat(user_msg: str, cox_summary: pd.DataFrame) -> str:
-    """
-    A no-API 'assistant': answers using the Cox summary + a few rule-based responses.
-    """
-    msg = user_msg.lower()
+    """Local assistant (no API): answers using Cox summary + rule-based explanations."""
+    msg = user_msg.lower().strip()
 
-    if "most important" in msg or "strongest" in msg or "top" in msg:
-        # strongest by absolute coef
+    if any(k in msg for k in ["most important", "strongest", "top feature", "largest effect"]):
         s = cox_summary.copy()
         s["abs_coef"] = s["coef"].abs()
         top = s.sort_values("abs_coef", ascending=False).head(3)
@@ -133,188 +152,243 @@ def simple_local_chat(user_msg: str, cox_summary: pd.DataFrame) -> str:
 
     if "microglia" in msg:
         hr = float(cox_summary.loc["microglia_contact_time", "exp(coef)"])
+        coef = float(cox_summary.loc["microglia_contact_time", "coef"])
         return (
-            f"Microglia contact time has HR={hr:.2f}. That means higher microglia contact is associated "
-            f"with faster failure (higher hazard)."
+            f"**microglia_contact_time** has HR={hr:.2f} (coef={coef:.3f}). "
+            f"HR>1 means more microglia contact is associated with faster failure (higher hazard)."
         )
 
-    if "aggregation" in msg or "tdp-43" in msg or "tau" in msg:
+    if "aggregation" in msg or "tdp" in msg or "tau" in msg:
         hr = float(cox_summary.loc["aggregation_slope", "exp(coef)"])
+        coef = float(cox_summary.loc["aggregation_slope", "coef"])
         return (
-            f"Aggregation slope has HR={hr:.2f}. Higher early aggregation trend predicts faster failure."
+            f"**aggregation_slope** has HR={hr:.2f} (coef={coef:.3f}). "
+            f"Higher early aggregation trend predicts faster failure."
         )
 
     if "calcium" in msg:
         hr = float(cox_summary.loc["calcium_rate", "exp(coef)"])
+        coef = float(cox_summary.loc["calcium_rate", "coef"])
         return (
-            f"Calcium rate has HR={hr:.2f}. Because HR < 1, higher calcium activity is protective (slower failure)."
+            f"**calcium_rate** has HR={hr:.2f} (coef={coef:.3f}). "
+            f"Because HR<1, higher calcium activity is protective (slower failure)."
         )
 
     if "neurite" in msg:
         hr = float(cox_summary.loc["neurite_growth", "exp(coef)"])
+        coef = float(cox_summary.loc["neurite_growth", "coef"])
         return (
-            f"Neurite growth has HR={hr:.2f}. HR slightly below 1 suggests healthier neurite growth is mildly protective."
+            f"**neurite_growth** has HR={hr:.2f} (coef={coef:.3f}). "
+            f"HR slightly below 1 suggests neurite growth is mildly protective."
         )
 
-    if "what is hazard" in msg or "hazard ratio" in msg:
+    if "hazard ratio" in msg or "hr" in msg or "what is hazard" in msg:
         return (
-            "Hazard ratio (HR) describes relative risk of failure over time. HR>1 means higher feature values are linked "
-            "to faster failure; HR<1 means they are linked to slower failure."
+            "**Hazard ratio (HR)** is a relative risk over time.\n\n"
+            "- HR > 1: higher values of that feature → faster failure\n"
+            "- HR < 1: higher values of that feature → slower failure\n\n"
+            "In a Cox model, these effects are *multiplicative* on the hazard."
+        )
+
+    if "p value" in msg or "p-value" in msg:
+        return (
+            "A **p-value** measures how strong the evidence is that a feature’s effect is not zero.\n\n"
+            "Smaller p-values (e.g., <0.05) generally indicate the feature is likely associated with failure risk."
         )
 
     return (
-        "Ask me things like: 'Which feature is most important?', "
-        "'Explain microglia_contact_time', or 'What does HR mean?'"
+        "Try asking:\n"
+        "- “Which feature is most important?”\n"
+        "- “Explain microglia_contact_time”\n"
+        "- “What does hazard ratio mean?”\n"
+        "- “Why is calcium protective?”"
     )
-
-
-def openai_chat(user_msg: str, cox_summary: pd.DataFrame) -> str:
-    """
-    Optional: real AI assistant. Requires OPENAI_API_KEY env var and openai package.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return "OpenAI chat is not enabled because OPENAI_API_KEY is not set."
-
-    client = OpenAI(api_key=api_key)
-
-    context = "Cox model summary (coef, HR, p):\n" + cox_summary.to_string()
-
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "You are a helpful research assistant interpreting an FTD cell-level Cox survival model."},
-            {"role": "user", "content": f"{context}\n\nUser question: {user_msg}"},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
 
 
 # =========================
-# STREAMLIT APP
+# APP UI
 # =========================
 st.set_page_config(page_title="FTD Cell Failure Predictor", layout="wide")
-st.title("FTD Cell-Level Failure Predictor (Survival + Verbal Interpretation + Chat)")
+st.title("FTD Cell-Level Failure Predictor")
+st.caption("Survival modeling + visualizations + verbal interpretation + local chat (no API)")
 
-# Load data
-# =========================
-# DATA LOADING (UPLOAD OR LOCAL)
-# =========================
+# Sidebar: upload
 st.sidebar.header("Data")
-uploaded_file = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
+uploaded_file = st.sidebar.file_uploader("Upload a CSV", type=["csv"])
+df = load_dataframe(uploaded_file, DEFAULT_DATA_PATH)
+st.sidebar.caption("Using: " + ("Uploaded CSV" if uploaded_file is not None else DEFAULT_DATA_PATH))
 
-def load_dataframe(uploaded_file, fallback_path: str) -> pd.DataFrame:
-    if uploaded_file is not None:
-        try:
-            return pd.read_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"Failed to read uploaded CSV: {e}")
-            st.stop()
-    else:
-        if not os.path.exists(fallback_path):
-            st.error(
-                f"Could not find `{fallback_path}` and no CSV was uploaded.\n\n"
-                f"Upload a CSV using the sidebar, or place `{fallback_path}` in the same folder as app.py."
-            )
-            st.stop()
-        try:
-            return pd.read_csv(fallback_path)
-        except Exception as e:
-            st.error(f"Failed to read `{fallback_path}`: {e}")
-            st.stop()
+# Validate required columns
+validate_columns(df)
 
-df = load_dataframe(uploaded_file, DATA_PATH)
-
-st.sidebar.caption("Using: " + ("Uploaded CSV" if uploaded_file is not None else DATA_PATH))
-
-df = pd.read_csv(DATA_PATH)
-
-required = FEATURE_COLS + [DURATION_COL, EVENT_COL]
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(
-        "Uploaded CSV is missing required columns:\n\n"
-        + "\n".join([f"- {c}" for c in missing])
-        + "\n\nExpected columns include:\n"
-        + "\n".join([f"- {c}" for c in required])
-    )
-    st.stop()
-
-df = df.dropna(subset=required).copy()
+# Clean
+df = df.dropna(subset=FEATURE_COLS + [DURATION_COL, EVENT_COL]).copy()
 df[EVENT_COL] = df[EVENT_COL].astype(int)
 
-# Fit scaler on full dataset (demo app). For strict science, fit on train split only.
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(df[FEATURE_COLS])
-df_scaled = df.copy()
-df_scaled[FEATURE_COLS] = X_scaled
+# Tabs
+tab_predict, tab_viz, tab_chat = st.tabs(["Predict", "Visualizations", "Chat"])
 
-# Fit Cox model
+# Fit scaler + Cox on full data (demo). For strict research, fit on train split only.
+scaler = StandardScaler()
+df_scaled = df.copy()
+df_scaled[FEATURE_COLS] = scaler.fit_transform(df_scaled[FEATURE_COLS])
+
 cph = CoxPHFitter(penalizer=PENALIZER)
-cph.fit(df_scaled[FEATURE_COLS + [DURATION_COL, EVENT_COL]], duration_col=DURATION_COL, event_col=EVENT_COL)
+cph.fit(df_scaled[FEATURE_COLS + [DURATION_COL, EVENT_COL]],
+        duration_col=DURATION_COL, event_col=EVENT_COL)
+
 summary = cph.summary.loc[FEATURE_COLS, ["coef", "exp(coef)", "p"]]
 
-# Layout
-left, right = st.columns([1, 1])
 
-with left:
-    st.subheader("Model summary (Cox)")
-    st.dataframe(summary)
+# =========================
+# TAB: PREDICT
+# =========================
+with tab_predict:
+    left, right = st.columns([1, 1])
 
-    st.markdown("#### Quick interpretation")
-    st.markdown(describe_effects(summary))
+    with left:
+        st.subheader("Cox Model Summary")
+        st.dataframe(summary, use_container_width=True)
+        st.markdown("#### Quick interpretation")
+        st.markdown(describe_effects(summary))
 
-with right:
-    st.subheader("Make a prediction for a single cell")
+    with right:
+        st.subheader("Single-cell verbal prediction")
+        st.write("Enter a cell’s **raw feature values** (the app standardizes them internally).")
 
-    # User inputs in raw units (we will standardize using the dataset scaler)
-    raw_inputs = {}
-    raw_inputs["neurite_growth"] = st.number_input("neurite_growth", value=float(df["neurite_growth"].mean()))
-    raw_inputs["calcium_rate"] = st.number_input("calcium_rate", value=float(df["calcium_rate"].mean()))
-    raw_inputs["aggregation_slope"] = st.number_input("aggregation_slope", value=float(df["aggregation_slope"].mean()))
-    raw_inputs["microglia_contact_time"] = st.number_input("microglia_contact_time", value=float(df["microglia_contact_time"].mean()))
+        raw_inputs = {}
+        raw_inputs["neurite_growth"] = st.number_input(
+            "neurite_growth", value=float(df["neurite_growth"].mean())
+        )
+        raw_inputs["calcium_rate"] = st.number_input(
+            "calcium_rate", value=float(df["calcium_rate"].mean())
+        )
+        raw_inputs["aggregation_slope"] = st.number_input(
+            "aggregation_slope", value=float(df["aggregation_slope"].mean())
+        )
+        raw_inputs["microglia_contact_time"] = st.number_input(
+            "microglia_contact_time", value=float(df["microglia_contact_time"].mean())
+        )
 
-    if st.button("Predict risk (verbal)"):
-        # Standardize inputs using fitted scaler
-        arr = np.array([[raw_inputs[c] for c in FEATURE_COLS]])
-        arr_s = scaler.transform(arr)[0]
-        standardized = {FEATURE_COLS[i]: float(arr_s[i]) for i in range(len(FEATURE_COLS))}
+        if st.button("Predict risk (verbal)"):
+            arr = np.array([[raw_inputs[c] for c in FEATURE_COLS]])
+            arr_s = scaler.transform(arr)[0]
+            standardized = {FEATURE_COLS[i]: float(arr_s[i]) for i in range(len(FEATURE_COLS))}
 
-        st.markdown(verbal_prediction(standardized, summary))
+            md, rel_risk, bucket = verbal_prediction(standardized, summary)
+            st.markdown(md)
 
-        # Show partial hazard (relative hazard) directly from Cox model too
-        input_df = pd.DataFrame([standardized])
-        # Note: cph expects same columns; these are standardized features
-        partial_hazard = float(cph.predict_partial_hazard(input_df)[0])
-        st.markdown(f"**Cox predicted partial hazard:** `{partial_hazard:.3f}` (relative risk scale)")
+            # Cox partial hazard (relative hazard). cph expects standardized features.
+            input_df = pd.DataFrame([standardized])
+            partial_hazard = float(cph.predict_partial_hazard(input_df)[0])
+            st.markdown(f"**Cox predicted partial hazard:** `{partial_hazard:.3f}` (relative risk scale)")
 
-st.divider()
 
-# Chat section
-st.subheader("Chat with the model assistant")
+# =========================
+# TAB: VISUALIZATIONS
+# =========================
+with tab_viz:
+    st.subheader("Dataset Preview")
+    st.write(f"Showing first {MAX_PREVIEW_ROWS} rows:")
+    st.dataframe(df.head(MAX_PREVIEW_ROWS), use_container_width=True)
 
-if "chat" not in st.session_state:
-    st.session_state.chat = []
+    st.subheader("Summary Statistics")
+    st.dataframe(df[FEATURE_COLS + [DURATION_COL, EVENT_COL]].describe(), use_container_width=True)
 
-for role, content in st.session_state.chat:
-    with st.chat_message(role):
-        st.markdown(content)
+    st.subheader("Feature Distributions")
+    for col in FEATURE_COLS:
+        fig, ax = plt.subplots()
+        ax.hist(df[col].dropna().values, bins=MAX_HIST_BINS)
+        ax.set_title(f"Distribution: {col}")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        st.pyplot(fig)
 
-user_msg = st.chat_input("Ask about the model, features, hazard ratios, or results...")
-if user_msg:
-    st.session_state.chat.append(("user", user_msg))
-    with st.chat_message("user"):
-        st.markdown(user_msg)
+    st.subheader("Correlation Heatmap (Features)")
+    corr = df[FEATURE_COLS].corr(numeric_only=True)
+    fig, ax = plt.subplots()
+    im = ax.imshow(corr.values)
+    ax.set_xticks(range(len(FEATURE_COLS)))
+    ax.set_yticks(range(len(FEATURE_COLS)))
+    ax.set_xticklabels(FEATURE_COLS, rotation=45, ha="right")
+    ax.set_yticklabels(FEATURE_COLS)
+    fig.colorbar(im)
+    ax.set_title("Feature Correlations")
+    st.pyplot(fig)
 
-    with st.chat_message("assistant"):
-        if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
-            reply = openai_chat(user_msg, summary)
-        else:
-            reply = simple_local_chat(user_msg, summary)
+    st.subheader("Kaplan–Meier Survival Curve (Overall)")
+    kmf = KaplanMeierFitter()
+    fig, ax = plt.subplots()
+    kmf.fit(durations=df[DURATION_COL], event_observed=df[EVENT_COL], label="All cells")
+    kmf.plot(ax=ax)
+    ax.set_title("Overall Survival Curve")
+    ax.set_xlabel("Time (hours)")
+    ax.set_ylabel("Survival probability")
+    st.pyplot(fig)
 
-        st.markdown(reply)
+    st.subheader("Kaplan–Meier: High vs Low Microglia Contact (Median Split)")
+    med = df["microglia_contact_time"].median()
+    high = df[df["microglia_contact_time"] >= med]
+    low = df[df["microglia_contact_time"] < med]
 
-    st.session_state.chat.append(("assistant", reply))
+    fig, ax = plt.subplots()
+    kmf.fit(low[DURATION_COL], low[EVENT_COL], label="Low microglia contact")
+    kmf.plot(ax=ax)
+    kmf.fit(high[DURATION_COL], high[EVENT_COL], label="High microglia contact")
+    kmf.plot(ax=ax)
+    ax.set_title("Survival by Microglia Contact")
+    ax.set_xlabel("Time (hours)")
+    ax.set_ylabel("Survival probability")
+    st.pyplot(fig)
 
-st.caption("Note: Cox models predict relative hazard (risk over time). Exact time prediction requires extra assumptions or calibration.")
+    st.subheader("Cox Hazard Ratios (Feature Effects)")
+    hr = summary["exp(coef)"].copy()
+    fig, ax = plt.subplots()
+    ax.bar(hr.index, hr.values)
+    ax.axhline(1.0)
+    ax.set_yscale("log")
+    ax.set_title("Hazard Ratios (log scale) — >1 increases risk, <1 protective")
+    ax.set_ylabel("Hazard ratio (exp(coef))")
+    ax.set_xticklabels(hr.index, rotation=45, ha="right")
+    st.pyplot(fig)
+
+    st.subheader("Predicted Risk Distribution (Partial Hazard)")
+    # Using standardized features because Cox was fit on df_scaled
+    partial_haz = cph.predict_partial_hazard(df_scaled[FEATURE_COLS]).values.ravel()
+
+    fig, ax = plt.subplots()
+    ax.hist(partial_haz, bins=40)
+    ax.set_title("Distribution of Predicted Partial Hazard (Relative Risk)")
+    ax.set_xlabel("Partial hazard")
+    ax.set_ylabel("Count")
+    st.pyplot(fig)
+
+
+# =========================
+# TAB: CHAT
+# =========================
+with tab_chat:
+    st.subheader("Chat with the model assistant")
+    st.caption("This assistant answers using the Cox model summary (no external API).")
+
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
+
+    for role, content in st.session_state.chat:
+        with st.chat_message(role):
+            st.markdown(content)
+
+    user_msg = st.chat_input("Ask about hazard ratios, p-values, or specific features...")
+    if user_msg:
+        st.session_state.chat.append(("user", user_msg))
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        reply = simple_local_chat(user_msg, summary)
+
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+
+        st.session_state.chat.append(("assistant", reply))
+
+st.caption("Note: Cox models predict relative hazard over time. Exact time prediction requires calibration or additional modeling.")
